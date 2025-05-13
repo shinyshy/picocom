@@ -57,6 +57,9 @@
 
 #include "custbaud.h"
 
+
+#include "sys/time.h"
+
 /**********************************************************************/
 
 /* parity modes names */
@@ -105,6 +108,7 @@ const char *flow_str[] = {
 #define KEY_RECEIVE CKEY('r') /* receive file */
 #define KEY_HEX     CKEY('w') /* write hex */
 #define KEY_BREAK   CKEY('\\') /* break */
+#define KEY_TS      CKEY('n') /* toggle timestamp */
 
 /**********************************************************************/
 
@@ -294,6 +298,13 @@ int tty_write_sz;
         if ( tty_write_sz < TTY_WRITE_SZ_MIN )          \
             tty_write_sz = TTY_WRITE_SZ_MIN;            \
     } while (0)
+
+#define TTY_TIME_RESET		2
+#define TTY_TIME_DISPLAY	1
+#define TTY_TIME_NONE		0
+
+int tty_time = TTY_TIME_RESET;
+int tty_time_enable = 0;
 
 /**********************************************************************/
 
@@ -822,6 +833,48 @@ do_map (char *b, int map, char c)
     return n;
 }
 
+int
+do_ts(char *b, char c, int *tty_time)
+{
+    int n = -1;
+	char s[64];
+
+    if (tty_time_enable && *tty_time) {
+        struct timeval tv;
+        gettimeofday(&tv,NULL);
+
+        if((c != '\n') && (c != '\r')) {
+            if (tty_time_enable == 1) {
+                    time_t curTime = time(NULL);
+                    struct tm *now = localtime(&curTime);
+#if 0
+                    sprintf(s,"\x1B[36m" "[%04d-%02d-%02d %02d:%02d:%02d.%03d] " "\x1B[0m",
+                              now->tm_year+1900, now->tm_mon+1, now->tm_mday, now->tm_hour, now->tm_min, now->tm_sec, (int)(tv.tv_usec/1000));
+#else
+                    sprintf(s, "[%04d-%02d-%02d %02d:%02d:%02d.%03d] ",
+                              now->tm_year+1900, now->tm_mon+1, now->tm_mday, now->tm_hour, now->tm_min, now->tm_sec, (int)(tv.tv_usec/1000));
+#endif
+                memcpy(b, s, strlen(s));
+                b[strlen(s)] = c;
+                n = strlen(s) + 1;
+                *tty_time = TTY_TIME_NONE;
+            }
+        }
+    }
+
+    if (c == '\n' || c == '\r') {
+        *tty_time = TTY_TIME_DISPLAY;
+    }
+
+    if ( n < 0 ) {
+        b[0] = c; n = 1;
+    }
+
+    assert(n > 0);
+
+    return n;
+}
+
 void
 map_and_write (int fd, int map, char c)
 {
@@ -1040,6 +1093,8 @@ show_keys()
               KEYC(KEY_TOG_RTS));
     fd_printf(STO, "*** [C-%c] : Send break\r\n",
               KEYC(KEY_BREAK));
+    fd_printf(STO, "*** [C-%c] : Toggle timestamp display\r\n",
+              KEYC(KEY_TS));
     fd_printf(STO, "*** [C-%c] : Toggle local echo\r\n",
               KEYC(KEY_LECHO));
     fd_printf(STO, "*** [C-%c] : Write hex\r\n",
@@ -1378,6 +1433,14 @@ do_command (unsigned char c)
         term_break(tty_fd);
         fd_printf(STO, "\r\n*** break sent ***\r\n");
         break;
+    case KEY_TS:
+        tty_time_enable = (tty_time_enable + 1) % 2;
+        if (tty_time_enable == 0) {
+            fd_printf(STO, "\r\n*** Time Stamp Disable ***\r\n");
+        }
+        else {
+            fd_printf(STO, "\r\n*** Time Stamp Enable (mode=%d) ***\r\n", tty_time_enable);
+        }
     default:
         break;
     }
@@ -1510,6 +1573,7 @@ loop(void)
 
             char buff_rd[TTY_RD_SZ];
             char buff_map[TTY_RD_SZ * M_MAXMAP];
+            char buff_ts[TTY_RD_SZ * M_MAXMAP * 5];
 
             /* read from port */
 
@@ -1524,15 +1588,23 @@ loop(void)
             } else {
                 int i;
                 char *bmp = &buff_map[0];
-                if ( opts.log_filename )
-                    if ( writen_ni(log_fd, buff_rd, n) < n )
-                        fatal("write to logfile failed: %s", strerror(errno));
                 for (i = 0; i < n; i++) {
                     bmp += do_map(bmp, opts.imap, buff_rd[i]);
                 }
                 n = bmp - buff_map;
-                if ( writen_ni(STO, buff_map, n) < n )
+
+                char *ts = &buff_ts[0];
+                for (i = 0; i< n; i++) {
+                    ts += do_ts(ts, buff_map[i], &tty_time);
+                }
+                n = ts - buff_ts;
+
+                if ( writen_ni(STO, buff_ts, n) < n )
                     fatal("write to stdout failed: %s", strerror(errno));
+
+                if ( opts.log_filename )
+                    if ( writen_ni(log_fd, buff_ts, n) < n )
+                        fatal("write to logfile failed: %s", strerror(errno));
             }
         }
 
@@ -1731,7 +1803,7 @@ parse_args(int argc, char *argv[])
         /* no default error messages printed. */
         opterr = 0;
 
-        c = getopt_long(argc, argv, "hirulcqXnv:s:r:e:f:b:y:d:p:g:t:x:",
+        c = getopt_long(argc, argv, "hirulcqXnv:s:r:e:f:b:y:d:p:g:t:x:m",
                         longOptions, &optionIndex);
 
         if (c < 0)
@@ -1783,6 +1855,9 @@ parse_args(int argc, char *argv[])
             break;
         case 'n':
             opts.noescape = 1;
+            break;
+        case 'm':
+            tty_time_enable = 1;
             break;
         case 'f':
             switch (optarg[0]) {
